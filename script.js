@@ -619,7 +619,10 @@ const conversationHistory = [];
 
 async function getGroqReply(userText){
   // Send message + prior history to the serverless proxy
-  const response = await fetch('/api/chat', {
+  const CHAT_API = window.location.hostname.includes('vercel.app') || window.location.hostname === 'localhost'
+    ? '/api/chat'
+    : 'https://lawyer-website-bay-seven.vercel.app/api/chat';
+  const response = await fetch(CHAT_API, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -628,11 +631,16 @@ async function getGroqReply(userText){
     })
   });
 
+  const data = await response.json().catch(() => ({}));
+
   if(!response.ok){
-    throw new Error(`API ${response.status}`);
+    // The API returns a structured { error, code } — log the code, surface the message
+    const code    = data.code    || 'api_error';
+    const message = data.error   || `Erreur API (${response.status})`;
+    console.error('[getGroqReply] API error:', code, response.status, message);
+    throw new Error(message);           // caught by getBotReply and shown to user
   }
 
-  const data  = await response.json();
   const reply = data.reply || '';
 
   // Keep local history updated for multi-turn context
@@ -671,8 +679,17 @@ async function getBotReply(userText){
   try {
     return await getGroqReply(userText);
   } catch(err){
-    console.warn('Groq unavailable, using fallback:', err.message);
+    // err.message is already the user-friendly text coming from the API
+    console.warn('[getBotReply] Groq unavailable, using fallback. Reason:', err.message);
     await new Promise(r => setTimeout(r, 350));
+
+    // If the API returned a user-friendly error message (not a network failure),
+    // prefer showing it directly over the generic fallback text.
+    const isApiMessage = err.message && !err.message.startsWith('Failed to fetch') &&
+                         !err.message.startsWith('NetworkError') &&
+                         !err.message.startsWith('Load failed');
+    if(isApiMessage) return err.message;
+
     return fallbackReply(userText);
   }
 }

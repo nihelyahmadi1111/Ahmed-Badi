@@ -1,9 +1,11 @@
-﻿// api/chat.js — Vercel Serverless Function
+// api/chat.js — Vercel Serverless Function
 // Proxies Groq API calls so the API key never reaches the browser.
-// Environment variable required in Vercel dashboard: GROQ_API_KEY
+//
+// Required env var  : GROQ_API_KEY   — your Groq secret key (Vercel dashboard)
+// Optional env var  : GROQ_MODEL     — override the model (default: openai/gpt-oss-120b)
 
 const GROQ_URL   = 'https://api.groq.com/openai/v1/chat/completions';
-const GROQ_MODEL = 'llama-3.3-70b-versatile';
+const GROQ_MODEL = process.env.GROQ_MODEL || 'openai/gpt-oss-120b';
 
 const SYSTEM_PROMPT = `Tu es l'assistant virtuel officiel du Cabinet d'Avocat de Maître Ahmed Badi, avocat inscrit au Barreau de Tunis, Tunisie.
 
@@ -58,6 +60,16 @@ CE QUE TU NE FAIS PAS :
 - Discuter d'autre chose que le droit et les services du cabinet`;
 
 module.exports = async function handler(req, res) {
+  // Allow cross-origin requests (GitHub Pages → Vercel API)
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  // Handle preflight
+  if (req.method === 'OPTIONS') {
+    return res.status(204).end();
+  }
+
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
@@ -95,15 +107,54 @@ module.exports = async function handler(req, res) {
     });
 
     if (!groqRes.ok) {
-      const errText = await groqRes.text();
-      return res.status(502).json({ error: `Groq error ${groqRes.status}`, detail: errText });
+      let errBody = {};
+      try { errBody = await groqRes.json(); } catch (_) {}
+
+      const groqMsg  = errBody?.error?.message || '';
+      const groqType = errBody?.error?.type    || '';
+      const groqCode = errBody?.error?.code    || '';
+
+      // Map Groq error types to structured codes the frontend can act on
+      let code        = 'api_error';
+      let userMessage = 'Une erreur est survenue lors de la communication avec l\'assistant. Veuillez réessayer.';
+
+      if (groqRes.status === 401 || groqRes.status === 403) {
+        code        = 'auth_error';
+        userMessage = 'Erreur de configuration du serveur. Veuillez contacter le cabinet directement.';
+      } else if (groqRes.status === 429 || groqType === 'tokens' || groqCode === 'rate_limit_exceeded') {
+        code        = 'rate_limited';
+        userMessage = 'L\'assistant est momentanément surchargé. Veuillez patienter quelques secondes et réessayer.';
+      } else if (
+        groqRes.status === 404 ||
+        groqMsg.toLowerCase().includes('model') ||
+        groqCode === 'model_not_found'
+      ) {
+        code        = 'model_not_found';
+        userMessage = 'Le modèle d\'IA configuré est introuvable. Veuillez contacter le support technique.';
+      }
+
+      // Log the real Groq error server-side (never sent to browser)
+      console.error('[Groq error]', groqRes.status, JSON.stringify(errBody));
+
+      return res.status(502).json({ error: userMessage, code });
     }
 
     const data  = await groqRes.json();
     const reply = data.choices?.[0]?.message?.content?.trim() || '';
+
+    if (!reply) {
+      console.warn('[Groq] Empty reply from model:', GROQ_MODEL);
+      return res.status(200).json({ reply: 'Je n\'ai pas pu générer une réponse. Veuillez reformuler votre question.' });
+    }
+
     return res.status(200).json({ reply });
 
   } catch (err) {
-    return res.status(500).json({ error: 'Internal server error', detail: err.message });
+    // Network / JSON parse errors
+    console.error('[api/chat] Unexpected error:', err);
+    return res.status(500).json({
+      error: 'Une erreur interne est survenue. Veuillez réessayer ou contacter le cabinet directement.',
+      code:  'server_error'
+    });
   }
 };
